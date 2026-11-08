@@ -10,7 +10,7 @@ import {
 } from './config.js'
 import { config } from './config.js'
 const WATCHDOG_MS = config.watchdogMs
-import { serverReq, openMiMoEvents, agent } from './mimo-client.js'
+import { serverReq, openMiMoEvents, agent } from './mimo-client-old.js'
 import { isAuthorized, readBody, deny, bad } from './auth.js'
 import {
   openAICompletion,
@@ -34,7 +34,7 @@ import {
 import { categorizeTools } from './tool-mapper.js'
 
 
-import { fetchMimo } from './mimo-client.js';
+import { fetchMimo } from './mimo-client-old.js';
 import { accountManager } from './account-manager.js';
 
 
@@ -72,7 +72,7 @@ async function deleteSession(sid, retries = 3) {
 
 export function reverseProxy(clientReq, clientRes) {
   if (clientReq.url === '/v1/models' || clientReq.url === '/v1/models/') {
-    const models = ['MiMo-V2.6-Pro', 'MiMo-V2.6-Flash'];
+    const models = ['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.5-pro', 'mimo-v2.5', 'mimo-v2.6-pro-ultraspeed'];
     clientRes.writeHead(200, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({ data: models.map(id => ({ id, object: 'model' })) }));
     return;

@@ -70,10 +70,11 @@ export const SERVER_AUTH = SERVER_PASSWORD
   : "";
 
 export const mimoModels = [
-  "mimo-auto",
-  "xiaomi/mimo-v2.5",
-  "xiaomi/mimo-v2.5-pro",
-  "xiaomi/mimo-v2.5-pro-ultraspeed",
+  "mimo-v2.6-pro",
+  "mimo-v2.6-flash",
+  "mimo-v2.5-pro",
+  "mimo-v2.5",
+  "mimo-v2.6-pro-ultraspeed",
 ];
 
 
