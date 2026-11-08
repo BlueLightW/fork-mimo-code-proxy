@@ -1,0 +1,25 @@
+{
+  "name": "mimo-code-proxy",
+  "version": "1.0.0",
+  "description": "Proxy reverso para rotear requisições do MiMo Code / Xiaomi MiMo Platform de qualquer lugar.",
+  "type": "module",
+  "bin": {
+    "mimo-proxy": "mimo-proxy.js"
+  },
+  "scripts": {
+    "start": "node mimo-proxy.js",
+    "lint": "node --check mimo-proxy.js src/*.js test/*.js",
+    "test": "node --test",
+    "cli": "node src/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@pedrofariasx/toolstream": "^0.3.0",
+    "better-sqlite3": "^13.0.3",
+    "jsonrepair": "^3.15.0",
+    "playwright": "^1.65.0"
+  }
+}

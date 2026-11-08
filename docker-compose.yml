@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  mimo-code-proxy:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      - MIMO_PROXY_TOKEN=${MIMO_PROXY_TOKEN:-your-secret-token}
+      - MIMO_MULTI_ACCOUNT=true
+      - MIMO_ACCOUNT_POOL_SIZE=5
+      - MIMO_DB_PATH=/app/data/accounts.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
