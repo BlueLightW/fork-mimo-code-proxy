@@ -1,6 +1,17 @@
 import http from "node:http";
 import { upstream, SERVER_AUTH } from "./config.js";
 import { accountPool } from './account-pool.js';
+import crypto from 'node:crypto';
+
+// Cache de conversationId por API key/usuário
+const conversationCache = new Map();
+
+function getConversationId(apiKey) {
+    if (!conversationCache.has(apiKey)) {
+        conversationCache.set(apiKey, crypto.randomUUID());
+    }
+    return conversationCache.get(apiKey);
+}
 
 function buildQuery(messages) {
     const userMessages = (messages || []).filter(m => m.role === 'user');
@@ -30,6 +41,7 @@ function extractSystemPrompt(messages) {
         .map(m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content))
         .join('\n\n');
 }
+
 export async function fetchMimo(response, requestData) {
     const { accountManager } = await import('./account-manager.js');
     
@@ -37,7 +49,16 @@ export async function fetchMimo(response, requestData) {
     if (!account) throw new Error('Nenhuma conta cadastrada');
     
     const session = await accountManager.getOrCreateSession(account);
+    
+    // Extrai componentes da mensagem
     const queryStr = buildQuery(requestData.messages);
+    const systemPrompt = extractSystemPrompt(requestData.messages);
+    
+    // Combina system prompt + query no campo query (formato aceito pelo MiMo Web)
+    const fullQuery = systemPrompt ? `${systemPrompt}\n\nUser: ${queryStr}` : queryStr;
+    
+    // Usa conversationId persistente baseado no model + timestamp (para manter contexto)
+    const conversationId = getConversationId(`${requestData.model}_${Date.now().toString().slice(0, -4)}`);
 
     if (requestData.stream) {
         response.writeHead(200, {
@@ -62,135 +83,133 @@ export async function fetchMimo(response, requestData) {
             await session.page.waitForTimeout(1000);
         }
 
-        const evalPromise = session.page.evaluate(async ({ body, funcName, queryStr }) => {
-    try {
-        let ph = (document.cookie.match(/xiaomichatbot_ph="?([^";]+)"?/) || [])[1] || "";
-        
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 120000);
-        
-        // Extrai system prompt das mensagens
-        const systemPrompt = (() => {
-            const systemMessages = (body.messages || []).filter(m => m.role === 'system');
-            return systemMessages
-                .map(m => typeof m.content === 'string' ? m.content : '')
-                .filter(s => s.length > 0)
-                .join('\n\n');
-        })();
-        
-        console.log('[MiMo Request] Model:', body.model);
-        console.log('[MiMo Request] Query length:', queryStr.length);
-        console.log('[MiMo Request] System prompt length:', systemPrompt.length);
-        
-        const res = await fetch('/open-apis/react/chat?xiaomichatbot_ph=' + encodeURIComponent(ph), {
-            signal: controller.signal,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-timeZone': Intl.DateTimeFormat().resolvedOptions().timeZone,
-                'Accept': 'text/event-stream'
-            },
-            body: JSON.stringify({
-                msgId: self.crypto.randomUUID(),
-                conversationId: self.crypto.randomUUID(),
-                query: queryStr,
-                systemPrompt: systemPrompt, // ← ADICIONADO
-                isEditedQuery: false,
-                modelConfig: {
-                    enableThinking: false,
-                    webSearchStatus: 'disabled',
-                    model: (() => {
-                        const m = (body.model || "").toLowerCase();
-                        if (m.includes("flash")) return "mimo-v2.6-flash";
-                        if (m.includes("v2.5-pro")) return "mimo-v2.5-pro";
-                        if (m.includes("v2.5")) return "mimo-v2.5";
-                        if (m.includes("ultraspeed")) return "mimo-v2.6-pro-ultraspeed";
-                        return "mimo-v2.6-pro";
-                    })(),
-                    temperature: body.temperature ?? 0.8,
-                    topP: body.top_p ?? 0.95,
-                },
-                multiMedias: [],
-            }),
-        });
+        const evalPromise = session.page.evaluate(async ({ body, funcName, fullQuery, conversationId }) => {
+            try {
+                let ph = (document.cookie.match(/xiaomichatbot_ph="?([^";]+)"?/) || [])[1] || "";
+                
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 120000);
+                
+                console.log('[MiMo Request] Model:', body.model);
+                console.log('[MiMo Request] Query length:', fullQuery.length);
+                console.log('[MiMo Request] ConversationId:', conversationId);
+                
+                const res = await fetch('/open-apis/react/chat?xiaomichatbot_ph=' + encodeURIComponent(ph), {
+                    signal: controller.signal,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-timeZone': Intl.DateTimeFormat().resolvedOptions().timeZone,
+                        'Accept': 'text/event-stream'
+                    },
+                    body: JSON.stringify({
+                        msgId: self.crypto.randomUUID(),
+                        conversationId: conversationId,
+                        query: fullQuery,
+                        isEditedQuery: false,
+                        modelConfig: {
+                            enableThinking: false,
+                            webSearchStatus: 'disabled',
+                            model: (() => {
+                                const m = (body.model || "").toLowerCase();
+                                if (m.includes("flash")) return "mimo-v2.6-flash";
+                                if (m.includes("v2.5-pro")) return "mimo-v2.5-pro";
+                                if (m.includes("v2.5")) return "mimo-v2.5";
+                                if (m.includes("ultraspeed")) return "mimo-v2.6-pro-ultraspeed";
+                                return "mimo-v2.6-pro";
+                            })(),
+                            temperature: body.temperature ?? 0.8,
+                            topP: body.top_p ?? 0.95,
+                        },
+                        multiMedias: [],
+                    }),
+                });
 
-        if (!res.ok) throw new Error("HTTP " + res.status);
+                if (!res.ok) throw new Error("HTTP " + res.status);
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        let sentDone = false; // ← FLAG para evitar múltiplos [DONE]
-        
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            
-            buf += decoder.decode(value, { stream: true });
-            const lines = buf.split('\n');
-            buf = lines.pop() || '';
-            
-            for (let line of lines) {
-                line = line.trim();
-                if (!line) continue;
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                let sentDone = false;
                 
-                // Ignora linhas que não começam com 'data:'
-                if (!line.startsWith('data:')) continue;
-                
-                const dataStr = line.slice(5).trim();
-                
-                // Para no primeiro [DONE]
-                if (dataStr === '[DONE]') {
-                    if (!sentDone) {
-                        sentDone = true;
-                        await window[funcName]('data: [DONE]\n\n');
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    buf += decoder.decode(value, { stream: true });
+                    const lines = buf.split('\n');
+                    buf = lines.pop() || '';
+                    
+                    for (let line of lines) {
+                        line = line.trim();
+                        if (!line) continue;
+                        
+                        // Processa APENAS linhas que começam com 'data:'
+                        if (!line.startsWith('data:')) continue;
+                        
+                        const dataStr = line.slice(5).trim();
+                        
+                        // Para no [DONE]
+                        if (dataStr === '[DONE]') {
+                            if (!sentDone) {
+                                sentDone = true;
+                                await window[funcName]('data: [DONE]\n\n');
+                            }
+                            break;
+                        }
+                        
+                        try {
+                            const j = JSON.parse(dataStr);
+                            
+                            // FILTRO CRÍTICO: Ignora mensagens de erro/bloqueio
+                            const content = j.content || '';
+                            if (content && (
+                                content.includes("I can't answer") ||
+                                content.includes("网络中断") ||
+                                content.includes("stream got cut off") ||
+                                content.includes("interrupted") ||
+                                content.includes("please resend") ||
+                                /^\d+$/.test(content) || // Ignora se for apenas números
+                                content.length < 3 // Ignora chunks muito pequenos
+                            )) {
+                                console.warn('[MiMo] Filtered out:', content.substring(0, 50));
+                                continue;
+                            }
+                            
+                            // Envia reasoning separado
+                            if (j.reasoningContent) {
+                                await window[funcName]('data: ' + JSON.stringify({
+                                    choices: [{ delta: { reasoning_content: j.reasoningContent } }]
+                                }) + '\n\n');
+                            }
+                            
+                            // Envia content normal
+                            if (content && content.length >= 3) {
+                                await window[funcName]('data: ' + JSON.stringify({
+                                    choices: [{ delta: { content: content } }]
+                                }) + '\n\n');
+                            }
+                        } catch (e) {
+                            // Ignora JSON inválido
+                        }
                     }
-                    break; // Sai do loop de linhas
                 }
                 
-                try {
-                    const j = JSON.parse(dataStr);
-                    
-                    // Filtra respostas de erro/bloqueio do MiMo
-                    if (j.content && (
-                        j.content.includes("I can't answer") ||
-                        j.content.includes("网络中断") ||
-                        j.content.includes("stream got cut off")
-                    )) {
-                        console.warn('[MiMo] Blocked response detected:', j.content.substring(0, 50));
-                        continue; // Ignora esta linha
-                    }
-                    
-                    if (j.reasoningContent) {
-                        await window[funcName]('data: ' + JSON.stringify({
-                            choices: [{ delta: { reasoning_content: j.reasoningContent } }]
-                        }) + '\n\n');
-                    }
-                    
-                    if (j.content) {
-                        await window[funcName]('data: ' + JSON.stringify({
-                            choices: [{ delta: { content: j.content } }]
-                        }) + '\n\n');
-                    }
-                } catch (e) {
-                    // Ignora JSON inválido silenciosamente
+                if (!sentDone) {
+                    await window[funcName]('data: [DONE]\n\n');
                 }
+                
+                clearTimeout(timeout);
+                await window[funcName](null);
+            } catch (e) {
+                console.error('[MiMo Error]', e.message);
+                await window[funcName]('data: ' + JSON.stringify({
+                    error: { message: e.message, type: 'proxy_error' }
+                }) + '\n\n');
+                await window[funcName](null);
             }
-        }
-        
-        if (!sentDone) {
-            await window[funcName]('data: [DONE]\n\n');
-        }
-        
-        clearTimeout(timeout);
-        await window[funcName](null);
-    } catch (e) {
-        console.error('[MiMo Error]', e.message);
-        await window[funcName]('data: ' + JSON.stringify({
-            error: { message: e.message, type: 'proxy_error' }
-        }) + '\n\n');
-        await window[funcName](null);
-    }
-}, { body: requestData, funcName, queryStr });
+        }, { body: requestData, funcName, fullQuery, conversationId });
+
         let evalError = null;
         evalPromise.catch(e => { 
             evalError = e; 
@@ -234,68 +253,60 @@ export async function fetchMimo(response, requestData) {
     }
 
     // --- NÃO STREAMING ---
-// --- NÃO STREAMING ---
-const result = await session.page.evaluate(async ({ body, queryStr }) => {
-    try {
-        let ph = (document.cookie.match(/xiaomichatbot_ph="?([^";]+)"?/) || [])[1] || "";
-        
-        const systemPrompt = (() => {
-            const systemMessages = (body.messages || []).filter(m => m.role === 'system');
-            return systemMessages
-                .map(m => typeof m.content === 'string' ? m.content : '')
-                .filter(s => s.length > 0)
-                .join('\n\n');
-        })();
-        
-        const res = await fetch('/open-apis/react/chat?xiaomichatbot_ph=' + encodeURIComponent(ph), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                msgId: self.crypto.randomUUID(),
-                conversationId: self.crypto.randomUUID(),
-                query: queryStr,
-                systemPrompt: systemPrompt, // ← ADICIONADO
-                isEditedQuery: false,
-                modelConfig: {
-                    enableThinking: false,
-                    webSearchStatus: 'disabled',
-                    model: (() => {
-                        const m = (body.model || "").toLowerCase();
-                        if (m.includes("flash")) return "mimo-v2.6-flash";
-                        if (m.includes("v2.5-pro")) return "mimo-v2.5-pro";
-                        if (m.includes("v2.5")) return "mimo-v2.5";
-                        if (m.includes("ultraspeed")) return "mimo-v2.6-pro-ultraspeed";
-                        return "mimo-v2.6-pro";
-                    })(),
-                    temperature: body.temperature ?? 0.8,
-                    topP: body.top_p ?? 0.95,
-                },
-                multiMedias: [],
-            }),
-        });
-        
-        const text = await res.text();
-        let fullContent = '';
-        const lines = text.split('\n');
-        
-        for (let line of lines) {
-            line = line.trim();
-            if (line.startsWith('data:')) {
-                const dataStr = line.slice(5).trim();
-                if (dataStr === '[DONE]') continue;
-                
-                try {
-                    const j = JSON.parse(dataStr);
-                    if (j.content) fullContent += j.content;
-                } catch {}
+    const result = await session.page.evaluate(async ({ body, fullQuery, conversationId }) => {
+        try {
+            let ph = (document.cookie.match(/xiaomichatbot_ph="?([^";]+)"?/) || [])[1] || "";
+            
+            const res = await fetch('/open-apis/react/chat?xiaomichatbot_ph=' + encodeURIComponent(ph), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    msgId: self.crypto.randomUUID(),
+                    conversationId: conversationId,
+                    query: fullQuery,
+                    isEditedQuery: false,
+                    modelConfig: {
+                        enableThinking: false,
+                        webSearchStatus: 'disabled',
+                        model: (() => {
+                            const m = (body.model || "").toLowerCase();
+                            if (m.includes("flash")) return "mimo-v2.6-flash";
+                            if (m.includes("v2.5-pro")) return "mimo-v2.5-pro";
+                            if (m.includes("v2.5")) return "mimo-v2.5";
+                            if (m.includes("ultraspeed")) return "mimo-v2.6-pro-ultraspeed";
+                            return "mimo-v2.6-pro";
+                        })(),
+                        temperature: body.temperature ?? 0.8,
+                        topP: body.top_p ?? 0.95,
+                    },
+                    multiMedias: [],
+                }),
+            });
+            
+            const text = await res.text();
+            let fullContent = '';
+            const lines = text.split('\n');
+            
+            for (let line of lines) {
+                line = line.trim();
+                if (line.startsWith('data:')) {
+                    const dataStr = line.slice(5).trim();
+                    if (dataStr === '[DONE]') continue;
+                    
+                    try {
+                        const j = JSON.parse(dataStr);
+                        if (j.content && j.content.length >= 3 && !/^\d+$/.test(j.content)) {
+                            fullContent += j.content;
+                        }
+                    } catch {}
+                }
             }
+            
+            return { status: res.status, text: fullContent };
+        } catch (e) {
+            return { status: 0, text: e.message };
         }
-        
-        return { status: res.status, text: fullContent };
-    } catch (e) {
-        return { status: 0, text: e.message };
-    }
-}, { body: requestData, queryStr });
+    }, { body: requestData, fullQuery, conversationId });
 
     if (result.status < 200 || result.status >= 300) {
         throw new Error('MiMo retornou erro: ' + result.text);
