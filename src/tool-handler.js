@@ -1,112 +1,172 @@
 // src/tool-handler.js
-// Converte tools do formato OpenAI para formato de prompt que o MiMo entende
 
-/**
- * Converte ferramentas do formato OpenAI para um system prompt que o MiMo pode usar
- */
 export function buildToolsSystemPrompt(tools, toolChoice = 'auto') {
     if (!tools || tools.length === 0) return '';
     
-    let prompt = '\n\n# Available Tools\n';
-    prompt += 'You have access to the following tools. When you need to use a tool, output it in the exact XML format shown below.\n\n';
+    // Prompt mais direto e específico para forçar XML puro
+    let prompt = '\n\n# TOOLS AVAILABLE (MANDATORY XML FORMAT)\n';
+    prompt += 'You MUST use tools when the task requires file access, shell commands, or code execution.\n';
+    prompt += 'When using a tool, you MUST output EXACTLY this XML block (no markdown, no code fences):\n\n';
+    prompt += '<tool_call>\n<name>FUNCTION_NAME</name>\n<arguments>{"param":"value"}</arguments>\n</tool_call>\n\n';
+    prompt += 'After the tool_call, wait for the result before continuing.\n\n';
+    prompt += '## Your tools:\n\n';
     
     for (const tool of tools) {
         if (tool.type === 'function' && tool.function) {
             const func = tool.function;
-            prompt += `## Tool: ${func.name}\n`;
-            if (func.description) {
-                prompt += `Description: ${func.description}\n`;
+            prompt += `### ${func.name}\n`;
+            if (func.description) prompt += `${func.description}\n`;
+            if (func.parameters) {
+                prompt += `Schema: ${JSON.stringify(func.parameters)}\n`;
             }
-            if (func.parameters && func.parameters.properties) {
-                prompt += 'Parameters (JSON Schema):\n';
-                prompt += '```json\n';
-                prompt += JSON.stringify(func.parameters, null, 2);
-                prompt += '\n```\n';
-            }
-            prompt += '\n### Usage Format:\n';
-            prompt += 'To call this tool, output EXACTLY this XML structure:\n';
-            prompt += '```xml\n';
-            prompt += `<tool_call>\n`;
-            prompt += `  <name>${func.name}</name>\n`;
-            prompt += `  <arguments>\n`;
-            prompt += `    { "param1": "value1", "param2": "value2" }\n`;
-            prompt += `  </arguments>\n`;
-            prompt += `</tool_call>\n`;
-            prompt += '```\n\n';
+            prompt += '\n';
         }
     }
     
     if (toolChoice === 'required') {
-        prompt += '\n**IMPORTANT: You MUST use one or more tools to answer this question.**\n';
-    } else if (toolChoice === 'none') {
-        prompt += '\n**Do NOT use any tools for this request.**\n';
+        prompt += '\n**YOU MUST USE AT LEAST ONE TOOL IN THIS RESPONSE.**\n';
     }
     
     return prompt;
 }
 
 /**
- * Extrai tool calls de texto formatado em XML
+ * Extrai tool calls de múltiplos formatos possíveis
  */
 export function extractToolCalls(text) {
     const toolCalls = [];
-    const regex = /<tool_call>\s*<name>(.*?)<\/name>\s*<arguments>(.*?)<\/arguments>\s*<\/tool_call>/gs;
-    
-    let match;
+    const seen = new Set();
     let index = 0;
     
-    while ((match = regex.exec(text)) !== null) {
-        const name = match[1].trim();
-        const argsStr = match[2].trim();
-        
+    // Padrão 1: XML <tool_call>
+    const re1 = /<tool_call>\s*<name>([^<]+)<\/name>\s*<arguments>([\s\S]*?)<\/arguments>\s*<\/tool_call>/g;
+    let m;
+    while ((m = re1.exec(text)) !== null) {
         try {
-            const args = JSON.parse(argsStr);
-            toolCalls.push({
-                id: `call_${Date.now()}_${index}`,
-                type: 'function',
-                function: {
-                    name: name,
-                    arguments: argsStr
+            const name = m[1].trim();
+            const argsStr = m[2].trim();
+            const key = `${name}:${argsStr}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                toolCalls.push({
+                    id: `call_${Date.now()}_${index++}`,
+                    type: 'function',
+                    function: { name, arguments: argsStr }
+                });
+            }
+        } catch {}
+    }
+    
+    // Padrão 2: MiMoML <function=NAME>{...}</function>
+    const re2 = /<function=([a-zA-Z_][a-zA-Z0-9_]*)>([\s\S]*?)<\/function>/g;
+    while ((m = re2.exec(text)) !== null) {
+        try {
+            const name = m[1].trim();
+            const argsStr = m[2].trim();
+            const key = `${name}:${argsStr}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                toolCalls.push({
+                    id: `call_${Date.now()}_${index++}`,
+                    type: 'function',
+                    function: { name, arguments: argsStr }
+                });
+            }
+        } catch {}
+    }
+    
+    // Padrão 3: TOOL_CALL: name {json}
+    const re3 = /TOOL_CALL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{[\s\S]*?\})(?=\n|$)/g;
+    while ((m = re3.exec(text)) !== null) {
+        try {
+            const name = m[1].trim();
+            const argsStr = m[2].trim();
+            const key = `${name}:${argsStr}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                toolCalls.push({
+                    id: `call_${Date.now()}_${index++}`,
+                    type: 'function',
+                    function: { name, arguments: argsStr }
+                });
+            }
+        } catch {}
+    }
+    
+    // Padrão 4: <|MiMoML|tool_calls>
+    const re4 = /<\|MiMoML\|tool_calls>([\s\S]*?)<\/\|MiMoML\|tool_calls>/g;
+    while ((m = re4.exec(text)) !== null) {
+        try {
+            const inner = m[1].trim();
+            // Tenta parsear como JSON array
+            const arr = JSON.parse(inner);
+            if (Array.isArray(arr)) {
+                for (const item of arr) {
+                    if (item.name && item.arguments !== undefined) {
+                        const argsStr = typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments);
+                        const key = `${item.name}:${argsStr}`;
+                        if (!seen.has(key)) {
+                            seen.add(key);
+                            toolCalls.push({
+                                id: `call_${Date.now()}_${index++}`,
+                                type: 'function',
+                                function: { name: item.name, arguments: argsStr }
+                            });
+                        }
+                    }
                 }
-            });
-            index++;
-        } catch (e) {
-            console.warn('[ToolHandler] Failed to parse tool call arguments:', e.message);
-        }
+            }
+        } catch {}
     }
     
     return toolCalls;
 }
 
 /**
- * Remove tool calls do texto e retorna apenas o conteúdo limpo
+ * Remove TODOS os formatos de tool calls do texto
  */
 export function removeToolCallsFromText(text) {
-    return text.replace(/<tool_call>.*?<\/tool_call>/gs, '').trim();
+    return text
+        .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+        .replace(/<function=[a-zA-Z_][a-zA-Z0-9_]*>[\s\S]*?<\/function>/g, '')
+        .replace(/TOOL_CALL:\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\{[\s\S]*?\}(?=\n|$)/g, '')
+        .replace(/<\|MiMoML\|tool_calls>[\s\S]*?<\/\|MiMoML\|tool_calls>/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 
 /**
- * Verifica se há tool calls incompletos no texto (streaming)
+ * Detecta se o modelo está apenas FALANDO sobre tool calls em vez de realmente chamá-los
  */
-export function hasIncompleteToolCall(text) {
-    return text.includes('<tool_call>') && !text.includes('</tool_call>');
-}
-
-/**
- * Encontra tool calls completos no texto
- */
-export function findCompleteToolBlocks(text) {
-    const blocks = [];
-    const regex = /<tool_call>.*?<\/tool_call>/gs;
+export function detectFakeToolCalls(text, availableTools) {
+    if (!availableTools || availableTools.length === 0) return { fake: false };
     
-    let match;
-    while ((match = regex.exec(text)) !== null) {
-        blocks.push({
-            start: match.index,
-            end: match.index + match[0].length,
-            text: match[0]
-        });
+    const toolNames = availableTools
+        .filter(t => t.type === 'function' && t.function)
+        .map(t => t.function.name);
+    
+    // Verifica se o texto menciona nomes de tools sem ter chamado
+    const mentionedTools = toolNames.filter(name => {
+        const regex = new RegExp(`\\b${name}\\b`, 'i');
+        return regex.test(text);
+    });
+    
+    const hasRealCalls = extractToolCalls(text).length > 0;
+    
+    if (mentionedTools.length > 0 && !hasRealCalls) {
+        return {
+            fake: true,
+            mentionedTools,
+            hint: `O modelo mencionou tools (${mentionedTools.join(', ')}) mas não emitiu chamadas reais.`
+        };
     }
     
-    return blocks;
+    return { fake: false };
+}
+
+export function hasIncompleteToolCall(text) {
+    return (
+        (text.includes('<tool_call') && !text.includes('</tool_call>')) ||
+        (text.match(/<function=[a-zA-Z_][a-zA-Z0-9_]*>/) && !text.includes('</function>'))
+    );
 }

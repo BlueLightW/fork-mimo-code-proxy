@@ -2,7 +2,7 @@ import http from "node:http";
 import { upstream, SERVER_AUTH } from "./config.js";
 import { accountPool } from './account-pool.js';
 import crypto from 'node:crypto';
-import { buildToolsSystemPrompt, extractToolCalls, removeToolCallsFromText } from './tool-handler.js';
+import { buildToolsSystemPrompt, extractToolCalls, removeToolCallsFromText, detectFakeToolCalls } from './tool-handler.js';
 
 // Cache de conversationId por API key/usuário
 const conversationCache = new Map();
@@ -50,6 +50,14 @@ function extractSystemPrompt(messages) {
 }
 
 export async function fetchMimo(response, requestData) {
+     console.log('[MiMo Request] Model:', requestData.model);
+    console.log('[MiMo Request] Stream:', requestData.stream);
+    console.log('[MiMo Request] Tools count:', requestData.tools?.length || 0);
+    if (requestData.tools?.length > 0) {
+        console.log('[MiMo Request] Tool names:', requestData.tools.map(t => t.function?.name).join(', '));
+    }
+    console.log('[MiMo Request] Messages count:', requestData.messages?.length || 0);
+    
     const { accountManager } = await import('./account-manager.js');
     
     const account = accountManager.accounts[0];
@@ -145,6 +153,9 @@ let buf = '';
 let sentDone = false;
 let fullText = ''; // Acumula todo o texto para detectar tool calls
 
+let lastSentContent = '';  // ← ADICIONAR
+let sentDoneCount = 0;     // ← ADICIONAR
+
 while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -159,8 +170,9 @@ while (true) {
         
         const dataStr = line.slice(5).trim();
         if (dataStr === '[DONE]') {
-            if (!sentDone) {
+            if (!sentDone && sentDoneCount < 1) {
                 sentDone = true;
+                sentDoneCount++;
                 await window[funcName]('data: [DONE]\n\n');
             }
             break;
@@ -211,12 +223,29 @@ while (true) {
                         }) + '\n\n');
                     }
                 } else {
-                    // Remove tool calls do texto antes de enviar
-                    const cleanContent = content.replace(/<tool_call>.*?<\/tool_call>/gs, '');
-                    if (cleanContent.trim().length > 0) {
-                        await window[funcName]('data: ' + JSON.stringify({
-                            choices: [{ delta: { content: cleanContent } }]
-                        }) + '\n\n');
+                    // DEDUPLICADOR: evita repetir o mesmo texto
+                    // (às vezes o MiMo reenvia o mesmo chunk com offset)
+                    if (content && content.length >= 3) {
+                        if (lastSentContent.endsWith(content) || content === lastSentContent) {
+                            continue;  // Pula chunk duplicado
+                        }
+                        
+                        // Se o novo conteúdo é apenas uma extensão do anterior, pega só o delta
+                        let delta = content;
+                        if (content.includes(lastSentContent.slice(-Math.min(50, lastSentContent.length)))) {
+                            const overlapIdx = lastSentContent.lastIndexOf(content.slice(0, 30));
+                            if (overlapIdx > 0 && overlapIdx + content.length > lastSentContent.length) {
+                                delta = content.slice(-(content.length - (lastSentContent.length - overlapIdx)));
+                            }
+                        }
+                        
+                        // Envia apenas o delta limpo
+                        if (delta && delta.length >= 3 && !/^\d+$/.test(delta)) {
+                            lastSentContent += delta;
+                            await window[funcName]('data: ' + JSON.stringify({
+                                choices: [{ delta: { content: delta } }]
+                            }) + '\n\n');
+                        }
                     }
                 }
             }
@@ -290,7 +319,7 @@ if (!sentDone) {
         return null;
     }
 
-        // --- NÃO STREAMING ---
+    // --- NÃO STREAMING ---
     const result = await session.page.evaluate(async ({ body, fullQuery, conversationId }) => {
         try {
             let ph = (document.cookie.match(/xiaomichatbot_ph="?([^";]+)"?/) || [])[1] || "";
@@ -351,9 +380,20 @@ if (!sentDone) {
         throw new Error('MiMo retornou erro: ' + result.text);
     }
 
-    // Extrai tool calls do texto completo (Node.js)
+    // Extrai tool calls do texto completo
     const toolCalls = extractToolCalls(result.text);
     const cleanText = removeToolCallsFromText(result.text);
+
+    // LOG: mostra o texto bruto para debug
+    console.log('[MiMo Debug] Raw text length:', result.text.length);
+    console.log('[MiMo Debug] Tool calls found:', toolCalls.length);
+    console.log('[MiMo Debug] Raw snippet:', result.text.substring(0, 500));
+
+    // Detecta "fake tool calls" - modelo falando sobre tools sem chamar
+    const fakeDetection = detectFakeToolCalls(result.text, requestData.tools);
+    if (fakeDetection.fake) {
+        console.warn('[MiMo] ⚠️', fakeDetection.hint);
+    }
 
     // Se há tool calls, retorna no formato OpenAI
     if (toolCalls.length > 0) {
@@ -369,6 +409,20 @@ if (!sentDone) {
         };
     }
 
+    // Se o modelo mencionou tools mas não chamou, avisa o cliente
+    if (fakeDetection.fake && requestData.tools && requestData.tools.length > 0) {
+        const hint = `\n\n⚠️ [Proxy] O modelo MiMo mencionou as tools (${fakeDetection.mentionedTools.join(', ')}) em texto natural, mas não emitiu chamadas estruturadas. Isso é uma limitação da API web do MiMo (aistudio.xiaomimimo.com) que não suporta tool calling nativo. Considere usar um modelo local (llama.cpp) ou API oficial (platform.xiaomimimo.com) para tarefas que requerem ferramentas.`;
+        return {
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: cleanText + hint
+                },
+                finish_reason: 'stop'
+            }]
+        };
+    }
+
     // Senão, retorna como texto normal
     return { 
         choices: [{ 
@@ -380,41 +434,6 @@ if (!sentDone) {
         }] 
     };
 }
-
-if (result.status < 200 || result.status >= 300) {
-    throw new Error('MiMo retornou erro: ' + result.text);
-}
-
-// Extrai tool calls do texto completo
-const toolCalls = extractToolCalls(result.text);
-const cleanText = removeToolCallsFromText(result.text);
-
-// Se há tool calls, retorna no formato OpenAI
-if (toolCalls.length > 0) {
-    return {
-        choices: [{
-            message: {
-                role: 'assistant',
-                content: cleanText || null,
-                tool_calls: toolCalls
-            },
-            finish_reason: 'tool_calls'
-        }]
-    };
-}
-
-// Senão, retorna como texto normal
-return { 
-    choices: [{ 
-        message: { 
-            role: 'assistant', 
-            content: cleanText 
-        },
-        finish_reason: 'stop'
-    }] 
-};
-
-
 
 export const agent = new http.Agent({
     keepAlive: true,
