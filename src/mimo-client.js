@@ -2,6 +2,7 @@ import http from "node:http";
 import { upstream, SERVER_AUTH } from "./config.js";
 import { accountPool } from './account-pool.js';
 import crypto from 'node:crypto';
+import { buildToolsSystemPrompt, extractToolCalls, removeToolCallsFromText } from './tool-handler.js';
 
 // Cache de conversationId por API key/usuário
 const conversationCache = new Map();
@@ -13,26 +14,32 @@ function getConversationId(apiKey) {
     return conversationCache.get(apiKey);
 }
 
-function buildQuery(messages) {
+function buildQuery(messages, tools = null, toolChoice = 'auto') {
     const userMessages = (messages || []).filter(m => m.role === 'user');
     if (userMessages.length === 0) return '';
     
     const lastMessage = userMessages[userMessages.length - 1];
     
+    let query = '';
     if (typeof lastMessage.content === 'string') {
-        return lastMessage.content;
-    }
-    
-    if (Array.isArray(lastMessage.content)) {
-        return lastMessage.content
+        query = lastMessage.content;
+    } else if (Array.isArray(lastMessage.content)) {
+        query = lastMessage.content
             .filter(p => p.type === 'text')
             .map(p => p.text)
             .join('\n');
+    } else {
+        query = String(lastMessage.content || '');
     }
     
-    return String(lastMessage.content || '');
+    // Se há tools, adiciona instruções no início da query
+    if (tools && tools.length > 0) {
+        const toolsPrompt = buildToolsSystemPrompt(tools, toolChoice);
+        return `${toolsPrompt}\n\nUser Query: ${query}`;
+    }
+    
+    return `Responda em português brasileiro.\n\nPergunta do usuário: ${query}`;
 }
-
 function extractSystemPrompt(messages) {
     const systemMessages = (messages || []).filter(m => m.role === 'system');
     if (systemMessages.length === 0) return '';
@@ -49,17 +56,22 @@ export async function fetchMimo(response, requestData) {
     if (!account) throw new Error('Nenhuma conta cadastrada');
     
     const session = await accountManager.getOrCreateSession(account);
+    const tools = requestData.tools || null;
+    const toolChoice = requestData.tool_choice || 'auto';
+    
+    // Constrói query com suporte a tools
+    const queryStr = buildQuery(requestData.messages, tools, toolChoice);
+    const conversationId = getConversationId(`${requestData.model}_${Date.now().toString().slice(0, -4)}`);
     
     // Extrai componentes da mensagem
-    const queryStr = buildQuery(requestData.messages);
+    
     const systemPrompt = extractSystemPrompt(requestData.messages);
     
     // Combina system prompt + query no campo query (formato aceito pelo MiMo Web)
     const fullQuery = systemPrompt ? `${systemPrompt}\n\nUser: ${queryStr}` : queryStr;
     
     // Usa conversationId persistente baseado no model + timestamp (para manter contexto)
-    const conversationId = getConversationId(`${requestData.model}_${Date.now().toString().slice(0, -4)}`);
-
+    
     if (requestData.stream) {
         response.writeHead(200, {
             'Content-Type': 'text/event-stream',
@@ -127,77 +139,103 @@ export async function fetchMimo(response, requestData) {
 
                 if (!res.ok) throw new Error("HTTP " + res.status);
 
-                const reader = res.body.getReader();
-                const decoder = new TextDecoder();
-                let buf = '';
-                let sentDone = false;
+               const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buf = '';
+let sentDone = false;
+let fullText = ''; // Acumula todo o texto para detectar tool calls
+
+while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    
+    for (let line of lines) {
+        line = line.trim();
+        if (!line || !line.startsWith('data:')) continue;
+        
+        const dataStr = line.slice(5).trim();
+        if (dataStr === '[DONE]') {
+            if (!sentDone) {
+                sentDone = true;
+                await window[funcName]('data: [DONE]\n\n');
+            }
+            break;
+        }
+        
+        try {
+            const j = JSON.parse(dataStr);
+            const content = j.content || '';
+            
+            // FILTRO: Ignora mensagens de erro
+            if (content && (
+                content.includes("I can't answer") ||
+                content.includes("网络中断") ||
+                /^\d+$/.test(content) ||
+                content.length < 3
+            )) {
+                continue;
+            }
+            
+            // Acumula texto para detectar tool calls
+            if (content) {
+                fullText += content;
                 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    
-                    buf += decoder.decode(value, { stream: true });
-                    const lines = buf.split('\n');
-                    buf = lines.pop() || '';
-                    
-                    for (let line of lines) {
-                        line = line.trim();
-                        if (!line) continue;
+                // Verifica se há tool calls completos
+                const toolCallRegex = /<tool_call>\s*<name>(.*?)<\/name>\s*<arguments>(.*?)<\/arguments>\s*<\/tool_call>/gs;
+                const matches = [...content.matchAll(toolCallRegex)];
+                
+                if (matches.length > 0) {
+                    // Envia tool calls no formato OpenAI
+                    for (const match of matches) {
+                        const name = match[1].trim();
+                        const argsStr = match[2].trim();
                         
-                        // Processa APENAS linhas que começam com 'data:'
-                        if (!line.startsWith('data:')) continue;
-                        
-                        const dataStr = line.slice(5).trim();
-                        
-                        // Para no [DONE]
-                        if (dataStr === '[DONE]') {
-                            if (!sentDone) {
-                                sentDone = true;
-                                await window[funcName]('data: [DONE]\n\n');
-                            }
-                            break;
-                        }
-                        
-                        try {
-                            const j = JSON.parse(dataStr);
-                            
-                            // FILTRO CRÍTICO: Ignora mensagens de erro/bloqueio
-                            const content = j.content || '';
-                            if (content && (
-                                content.includes("I can't answer") ||
-                                content.includes("网络中断") ||
-                                content.includes("stream got cut off") ||
-                                content.includes("interrupted") ||
-                                content.includes("please resend") ||
-                                /^\d+$/.test(content) || // Ignora se for apenas números
-                                content.length < 3 // Ignora chunks muito pequenos
-                            )) {
-                                console.warn('[MiMo] Filtered out:', content.substring(0, 50));
-                                continue;
-                            }
-                            
-                            // Envia reasoning separado
-                            if (j.reasoningContent) {
-                                await window[funcName]('data: ' + JSON.stringify({
-                                    choices: [{ delta: { reasoning_content: j.reasoningContent } }]
-                                }) + '\n\n');
-                            }
-                            
-                            // Envia content normal
-                            if (content && content.length >= 3) {
-                                await window[funcName]('data: ' + JSON.stringify({
-                                    choices: [{ delta: { content: content } }]
-                                }) + '\n\n');
-                            }
-                        } catch (e) {
-                            // Ignora JSON inválido
-                        }
+                        await window[funcName]('data: ' + JSON.stringify({
+                            choices: [{
+                                delta: {
+                                    tool_calls: [{
+                                        index: 0,
+                                        id: `call_${Date.now()}`,
+                                        type: 'function',
+                                        function: {
+                                            name: name,
+                                            arguments: argsStr
+                                        }
+                                    }]
+                                }
+                            }]
+                        }) + '\n\n');
+                    }
+                } else {
+                    // Remove tool calls do texto antes de enviar
+                    const cleanContent = content.replace(/<tool_call>.*?<\/tool_call>/gs, '');
+                    if (cleanContent.trim().length > 0) {
+                        await window[funcName]('data: ' + JSON.stringify({
+                            choices: [{ delta: { content: cleanContent } }]
+                        }) + '\n\n');
                     }
                 }
-                
-                if (!sentDone) {
-                    await window[funcName]('data: [DONE]\n\n');
-                }
+            }
+            
+            // Envia reasoning separado
+            if (j.reasoningContent) {
+                await window[funcName]('data: ' + JSON.stringify({
+                    choices: [{ delta: { reasoning_content: j.reasoningContent } }]
+                }) + '\n\n');
+            }
+        } catch (e) {
+            // Ignora JSON inválido
+        }
+    }
+}
+
+if (!sentDone) {
+    await window[funcName]('data: [DONE]\n\n');
+}
                 
                 clearTimeout(timeout);
                 await window[funcName](null);
@@ -252,7 +290,7 @@ export async function fetchMimo(response, requestData) {
         return null;
     }
 
-    // --- NÃO STREAMING ---
+        // --- NÃO STREAMING ---
     const result = await session.page.evaluate(async ({ body, fullQuery, conversationId }) => {
         try {
             let ph = (document.cookie.match(/xiaomichatbot_ph="?([^";]+)"?/) || [])[1] || "";
@@ -308,19 +346,75 @@ export async function fetchMimo(response, requestData) {
         }
     }, { body: requestData, fullQuery, conversationId });
 
+    // Validação de erro (Node.js, fora do evaluate)
     if (result.status < 200 || result.status >= 300) {
         throw new Error('MiMo retornou erro: ' + result.text);
     }
-    
+
+    // Extrai tool calls do texto completo (Node.js)
+    const toolCalls = extractToolCalls(result.text);
+    const cleanText = removeToolCallsFromText(result.text);
+
+    // Se há tool calls, retorna no formato OpenAI
+    if (toolCalls.length > 0) {
+        return {
+            choices: [{
+                message: {
+                    role: 'assistant',
+                    content: cleanText || null,
+                    tool_calls: toolCalls
+                },
+                finish_reason: 'tool_calls'
+            }]
+        };
+    }
+
+    // Senão, retorna como texto normal
     return { 
         choices: [{ 
             message: { 
                 role: 'assistant', 
-                content: result.text 
-            } 
+                content: cleanText 
+            },
+            finish_reason: 'stop'
         }] 
     };
 }
+
+if (result.status < 200 || result.status >= 300) {
+    throw new Error('MiMo retornou erro: ' + result.text);
+}
+
+// Extrai tool calls do texto completo
+const toolCalls = extractToolCalls(result.text);
+const cleanText = removeToolCallsFromText(result.text);
+
+// Se há tool calls, retorna no formato OpenAI
+if (toolCalls.length > 0) {
+    return {
+        choices: [{
+            message: {
+                role: 'assistant',
+                content: cleanText || null,
+                tool_calls: toolCalls
+            },
+            finish_reason: 'tool_calls'
+        }]
+    };
+}
+
+// Senão, retorna como texto normal
+return { 
+    choices: [{ 
+        message: { 
+            role: 'assistant', 
+            content: cleanText 
+        },
+        finish_reason: 'stop'
+    }] 
+};
+
+
 
 export const agent = new http.Agent({
     keepAlive: true,
